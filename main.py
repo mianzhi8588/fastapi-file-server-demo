@@ -5,27 +5,24 @@ from pydantic import BaseModel
 from pathlib import Path
 import shutil
 import secrets
-import json
 import hashlib
+import sqlite3
 
 
 app = FastAPI(
     title="FastAPI File Server Demo",
-    description="A simple API-only file server with user registration, login, and user-specific file access.",
-    version="2.0.0"
+    description="A simple API-only file server with database-backed user registration, login, and user-specific file access.",
+    version="3.0.0"
 )
 
 UPLOAD_DIR = Path("uploads")
 DATA_DIR = Path("data")
-USERS_FILE = DATA_DIR / "users.json"
+DATABASE_FILE = DATA_DIR / "app.db"
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 DATA_DIR.mkdir(exist_ok=True)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-# 登录 token 暂时存在内存里，服务器重启后会失效
-active_tokens = {}
 
 
 class UserRegister(BaseModel):
@@ -33,25 +30,120 @@ class UserRegister(BaseModel):
     password: str
 
 
-def load_users():
-    if not USERS_FILE.exists():
-        return {}
-
-    with USERS_FILE.open("r", encoding="utf-8") as f:
-        return json.load(f)
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def save_users(users):
-    with USERS_FILE.open("w", encoding="utf-8") as f:
-        json.dump(users, f, indent=2)
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            salt TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tokens (
+            token TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (username) REFERENCES users(username)
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
 
 
 def hash_password(password: str, salt: str):
     return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
 
 
+def get_user_by_username(username: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT username, salt, password_hash FROM users WHERE username = ?",
+        (username,)
+    )
+
+    user = cursor.fetchone()
+    conn.close()
+
+    return user
+
+
+def create_user(username: str, salt: str, password_hash: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO users (username, salt, password_hash)
+        VALUES (?, ?, ?)
+        """,
+        (username, salt, password_hash)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def create_token(username: str):
+    token = secrets.token_urlsafe(32)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO tokens (token, username)
+        VALUES (?, ?)
+        """,
+        (token, username)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return token
+
+
+def get_username_by_token(token: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT username FROM tokens
+        WHERE token = ?
+        """,
+        (token,)
+    )
+
+    token_record = cursor.fetchone()
+    conn.close()
+
+    if not token_record:
+        return None
+
+    return token_record["username"]
+
+
 def get_current_user(token: str = Depends(oauth2_scheme)):
-    username = active_tokens.get(token)
+    username = get_username_by_token(token)
 
     if not username:
         raise HTTPException(
@@ -60,6 +152,11 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         )
 
     return username
+
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
 
 
 @app.get("/")
@@ -72,8 +169,6 @@ def read_root():
 
 @app.post("/register")
 def register(user: UserRegister):
-    users = load_users()
-
     username = user.username.strip()
     password = user.password
 
@@ -83,18 +178,15 @@ def register(user: UserRegister):
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
-    if username in users:
+    existing_user = get_user_by_username(username)
+
+    if existing_user:
         raise HTTPException(status_code=400, detail="Username already exists")
 
     salt = secrets.token_hex(16)
     password_hash = hash_password(password, salt)
 
-    users[username] = {
-        "salt": salt,
-        "password_hash": password_hash
-    }
-
-    save_users(users)
+    create_user(username, salt, password_hash)
 
     user_upload_dir = UPLOAD_DIR / username
     user_upload_dir.mkdir(exist_ok=True)
@@ -107,26 +199,50 @@ def register(user: UserRegister):
 
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    users = load_users()
-
     username = form_data.username
     password = form_data.password
 
-    if username not in users:
+    user_record = get_user_by_username(username)
+
+    if not user_record:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    user_record = users[username]
     input_password_hash = hash_password(password, user_record["salt"])
 
     if input_password_hash != user_record["password_hash"]:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    token = secrets.token_urlsafe(32)
-    active_tokens[token] = username
+    token = create_token(username)
 
     return {
         "access_token": token,
         "token_type": "bearer"
+    }
+
+
+@app.get("/me")
+def get_me(current_user: str = Depends(get_current_user)):
+    return {
+        "username": current_user,
+        "message": "You are currently logged in."
+    }
+
+
+@app.post("/logout")
+def logout(token: str = Depends(oauth2_scheme)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "DELETE FROM tokens WHERE token = ?",
+        (token,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "message": "Logged out successfully"
     }
 
 
